@@ -8,6 +8,7 @@ import {
   PullRequestCoordinator,
   RepositoriesStore,
   SignInStore,
+  UpstreamRemoteName,
 } from '.'
 import { Account } from '../../models/account'
 import { AppMenu, IMenu } from '../../models/app-menu'
@@ -29,7 +30,11 @@ import {
   GitHubRepository,
   hasWritePermission,
 } from '../../models/github-repository'
-import { PullRequest } from '../../models/pull-request'
+import {
+  defaultPullRequestSuggestedNextAction,
+  PullRequest,
+  PullRequestSuggestedNextAction,
+} from '../../models/pull-request'
 import {
   forkPullRequestRemoteName,
   IRemote,
@@ -42,6 +47,7 @@ import {
   isRepositoryWithGitHubRepository,
   RepositoryWithGitHubRepository,
   getNonForkGitHubRepository,
+  isForkedRepositoryContributingToParent,
 } from '../../models/repository'
 import {
   CommittedFileChange,
@@ -77,6 +83,10 @@ import {
   updatePreferredAppMenuItemLabels,
   updateAccounts,
   setWindowZoomFactor,
+  onShowInstallingUpdate,
+  sendWillQuitEvenIfUpdatingSync,
+  quitApp,
+  sendCancelQuittingSync,
 } from '../../ui/main-process-proxy'
 import {
   API,
@@ -180,7 +190,7 @@ import {
   matchExistingRepository,
   urlMatchesRemote,
 } from '../repository-matching'
-import { isCurrentBranchForcePush } from '../rebase'
+import { ForcePushBranchState, getCurrentBranchForcePushState } from '../rebase'
 import { RetryAction, RetryActionType } from '../../models/retry-actions'
 import {
   Default as DefaultShell,
@@ -304,6 +314,7 @@ import { offsetFromNow } from '../offset-from'
 import { findContributionTargetDefaultBranch } from '../branch'
 import { ValidNotificationPullRequestReview } from '../valid-notification-pull-request-review'
 import { determineMergeability } from '../git/merge-tree'
+import { PopupManager } from '../popup-manager'
 
 const LastSelectedRepositoryIDKey = 'last-selected-repository-id'
 
@@ -378,6 +389,9 @@ const MaxInvalidFoldersToDisplay = 3
 
 const lastThankYouKey = 'version-and-users-of-last-thank-you'
 const customThemeKey = 'custom-theme-key'
+const pullRequestSuggestedNextActionKey =
+  'pull-request-suggested-next-action-key'
+
 export class AppStore extends TypedBaseStore<IAppState> {
   private readonly gitStoreCache: GitStoreCache
 
@@ -396,10 +410,8 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
   private showWelcomeFlow = false
   private focusCommitMessage = false
-  private currentPopup: Popup | null = null
   private currentFoldout: Foldout | null = null
   private currentBanner: Banner | null = null
-  private errors: ReadonlyArray<Error> = new Array<Error>()
   private emitQueued = false
 
   private readonly localRepositoryStateLookup = new Map<
@@ -500,6 +512,13 @@ export class AppStore extends TypedBaseStore<IAppState> {
   private lastThankYou: ILastThankYou | undefined
   private showCIStatusPopover: boolean = false
 
+  /** A service for managing the stack of open popups */
+  private popupManager = new PopupManager()
+
+  private pullRequestSuggestedNextAction:
+    | PullRequestSuggestedNextAction
+    | undefined = undefined
+
   public constructor(
     private readonly gitHubUserStore: GitHubUserStore,
     private readonly cloningRepositoriesStore: CloningRepositoriesStore,
@@ -582,6 +601,8 @@ export class AppStore extends TypedBaseStore<IAppState> {
     this.notificationsStore.onPullRequestReviewSubmitNotification(
       this.onPullRequestReviewSubmitNotification
     )
+
+    onShowInstallingUpdate(this.onShowInstallingUpdate)
   }
 
   private initializeWindowState = async () => {
@@ -639,7 +660,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
     // If there is a currently open popup, don't do anything here. Since the
     // app can only show one popup at a time, we don't want to close the current
     // one in favor of the error we're about to show.
-    if (this.currentPopup !== null) {
+    if (this.popupManager.isAPopupOpen) {
       return
     }
 
@@ -649,6 +670,12 @@ export class AppStore extends TypedBaseStore<IAppState> {
     this._showPopup({
       type: PopupType.InvalidatedToken,
       account,
+    })
+  }
+
+  private onShowInstallingUpdate = () => {
+    this._showPopup({
+      type: PopupType.InstallingUpdate,
     })
   }
 
@@ -904,9 +931,10 @@ export class AppStore extends TypedBaseStore<IAppState> {
       appIsFocused: this.appIsFocused,
       selectedState: this.getSelectedState(),
       signInState: this.signInStore.getState(),
-      currentPopup: this.currentPopup,
+      currentPopup: this.popupManager.currentPopup,
+      allPopups: this.popupManager.allPopups,
       currentFoldout: this.currentFoldout,
-      errors: this.errors,
+      errorCount: this.popupManager.getPopupsOfType(PopupType.Error).length,
       showWelcomeFlow: this.showWelcomeFlow,
       focusCommitMessage: this.focusCommitMessage,
       emoji: this.emoji,
@@ -954,6 +982,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
       lastThankYou: this.lastThankYou,
       showCIStatusPopover: this.showCIStatusPopover,
       notificationsEnabled: getNotificationsEnabled(),
+      pullRequestSuggestedNextAction: this.pullRequestSuggestedNextAction,
     }
   }
 
@@ -1736,6 +1765,9 @@ export class AppStore extends TypedBaseStore<IAppState> {
     )
     setNumberArray(RecentRepositoriesKey, slicedRecentRepositories)
     this.recentRepositories = slicedRecentRepositories
+    this.notificationsStore.setRecentRepositories(
+      this.repositories.filter(r => this.recentRepositories.includes(r.id))
+    )
     this.emitUpdate()
   }
 
@@ -2067,6 +2099,12 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
     this.lastThankYou = getObject<ILastThankYou>(lastThankYouKey)
 
+    this.pullRequestSuggestedNextAction =
+      getEnum(
+        pullRequestSuggestedNextActionKey,
+        PullRequestSuggestedNextAction
+      ) ?? defaultPullRequestSuggestedNextAction
+
     this.emitUpdateNow()
 
     this.accountsStore.refresh()
@@ -2231,10 +2269,12 @@ export class AppStore extends TypedBaseStore<IAppState> {
           ?.name ?? undefined
     }
 
-    const isForcePushForCurrentRepository = isCurrentBranchForcePush(
-      branchesState,
-      aheadBehind
-    )
+    // From the menu, we'll offer to force-push whenever it's possible, regardless
+    // of whether or not the user performed any action we know would be followed
+    // by a force-push.
+    const isForcePushForCurrentRepository =
+      getCurrentBranchForcePushState(branchesState, aheadBehind) !==
+      ForcePushBranchState.NotAvailable
 
     const isStashedChangesVisible =
       changesState.selection.kind === ChangesSelectionKind.Stash
@@ -2508,7 +2548,10 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
     if (
       displayingBanner ||
-      isConflictsFlow(this.currentPopup, multiCommitOperationState)
+      isConflictsFlow(
+        this.popupManager.areTherePopupsOfType(PopupType.MultiCommitOperation),
+        multiCommitOperationState
+      )
     ) {
       return
     }
@@ -2598,7 +2641,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
     const { multiCommitOperationState } = state
     if (
       userIsStartingMultiCommitOperation(
-        this.currentPopup,
+        this.popupManager.currentPopup,
         multiCommitOperationState
       )
     ) {
@@ -3480,32 +3523,45 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
   /** This shouldn't be called directly. See `Dispatcher`. */
   public async _showPopup(popup: Popup): Promise<void> {
-    this._closePopup()
-
     // Always close the app menu when showing a pop up. This is only
     // applicable on Windows where we draw a custom app menu.
     this._closeFoldout(FoldoutType.AppMenu)
 
-    this.currentPopup = popup
+    this.popupManager.addPopup(popup)
     this.emitUpdate()
   }
 
   /** This shouldn't be called directly. See `Dispatcher`. */
   public _closePopup(popupType?: PopupType) {
-    const currentPopup = this.currentPopup
-    if (currentPopup == null) {
+    const currentPopup = this.popupManager.currentPopup
+    if (currentPopup === null) {
       return
     }
 
-    if (popupType !== undefined && currentPopup.type !== popupType) {
+    if (popupType === undefined) {
+      this.popupManager.removePopup(currentPopup)
+    } else {
+      if (currentPopup.type !== popupType) {
+        return
+      }
+
+      if (currentPopup.type === PopupType.CloneRepository) {
+        this._completeOpenInDesktop(() => Promise.resolve(null))
+      }
+
+      this.popupManager.removePopupByType(popupType)
+    }
+
+    this.emitUpdate()
+  }
+
+  /** This shouldn't be called directly. See `Dispatcher`. */
+  public _closePopupById(popupId: string) {
+    if (this.popupManager.currentPopup === null) {
       return
     }
 
-    if (currentPopup.type === PopupType.CloneRepository) {
-      this._completeOpenInDesktop(() => Promise.resolve(null))
-    }
-
-    this.currentPopup = null
+    this.popupManager.removePopupById(popupId)
     this.emitUpdate()
   }
 
@@ -3927,17 +3983,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
   /** This shouldn't be called directly. See `Dispatcher`. */
   public _pushError(error: Error): Promise<void> {
-    const newErrors = Array.from(this.errors)
-    newErrors.push(error)
-    this.errors = newErrors
-    this.emitUpdate()
-
-    return Promise.resolve()
-  }
-
-  /** This shouldn't be called directly. See `Dispatcher`. */
-  public _clearError(error: Error): Promise<void> {
-    this.errors = this.errors.filter(e => e !== error)
+    this.popupManager.addErrorPopup(error)
     this.emitUpdate()
 
     return Promise.resolve()
@@ -5915,7 +5961,10 @@ export class AppStore extends TypedBaseStore<IAppState> {
     await this._openInBrowser(url.toString())
   }
 
-  public async _createPullRequest(repository: Repository): Promise<void> {
+  public async _createPullRequest(
+    repository: Repository,
+    baseBranch?: Branch
+  ): Promise<void> {
     const gitHubRepository = repository.gitHubRepository
     if (!gitHubRepository) {
       return
@@ -5928,24 +5977,28 @@ export class AppStore extends TypedBaseStore<IAppState> {
       return
     }
 
-    const branch = tip.branch
+    const compareBranch = tip.branch
     const aheadBehind = state.aheadBehind
 
     if (aheadBehind == null) {
       this._showPopup({
         type: PopupType.PushBranchCommits,
         repository,
-        branch,
+        branch: compareBranch,
       })
     } else if (aheadBehind.ahead > 0) {
       this._showPopup({
         type: PopupType.PushBranchCommits,
         repository,
-        branch,
+        branch: compareBranch,
         unPushedCommits: aheadBehind.ahead,
       })
     } else {
-      await this._openCreatePullRequestInBrowser(repository, branch)
+      await this._openCreatePullRequestInBrowser(
+        repository,
+        compareBranch,
+        baseBranch
+      )
     }
   }
 
@@ -6040,15 +6093,38 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
   public async _openCreatePullRequestInBrowser(
     repository: Repository,
-    branch: Branch
+    compareBranch: Branch,
+    baseBranch?: Branch
   ): Promise<void> {
     const gitHubRepository = repository.gitHubRepository
     if (!gitHubRepository) {
       return
     }
 
-    const urlEncodedBranchName = encodeURIComponent(branch.nameWithoutRemote)
-    const baseURL = `${gitHubRepository.htmlURL}/pull/new/${urlEncodedBranchName}`
+    const { parent, owner, name, htmlURL } = gitHubRepository
+    const isForkContributingToParent =
+      isForkedRepositoryContributingToParent(repository)
+
+    const baseForkPreface =
+      isForkContributingToParent && parent !== null
+        ? `${parent.owner.login}:${parent.name}:`
+        : ''
+    const encodedBaseBranch =
+      baseBranch !== undefined
+        ? baseForkPreface +
+          encodeURIComponent(baseBranch.nameWithoutRemote) +
+          '...'
+        : ''
+
+    const compareForkPreface = isForkContributingToParent
+      ? `${owner.login}:${name}:`
+      : ''
+
+    const encodedCompareBranch =
+      compareForkPreface + encodeURIComponent(compareBranch.nameWithoutRemote)
+
+    const compareString = `${encodedBaseBranch}${encodedCompareBranch}`
+    const baseURL = `${htmlURL}/pull/new/${compareString}`
 
     await this._openInBrowser(baseURL)
 
@@ -6497,13 +6573,13 @@ export class AppStore extends TypedBaseStore<IAppState> {
         path,
         (title, value, description) => {
           if (
-            this.currentPopup !== null &&
-            this.currentPopup.type === PopupType.CreateTutorialRepository
+            this.popupManager.currentPopup?.type ===
+            PopupType.CreateTutorialRepository
           ) {
-            this.currentPopup = {
-              ...this.currentPopup,
+            this.popupManager.updatePopup({
+              ...this.popupManager.currentPopup,
               progress: { kind: 'generic', title, value, description },
-            }
+            })
             this.emitUpdate()
           }
         }
@@ -6567,6 +6643,25 @@ export class AppStore extends TypedBaseStore<IAppState> {
     }
   }
 
+  /**
+   * Multi selection on the commit list can give an order of 1, 5, 3 if that is
+   * how the user selected them. However, we want to main chronological ordering
+   * of the commits to reduce the chance of conflicts during interact rebasing.
+   * Thus, assuming 1 is the first commit made by the user and 5 is the last. We
+   * want the order to be, 1, 3, 5.
+   */
+  private orderCommitsByHistory(
+    repository: Repository,
+    commits: ReadonlyArray<CommitOneLine>
+  ) {
+    const { compareState } = this.repositoryStateCache.get(repository)
+    const { commitSHAs } = compareState
+
+    return [...commits].sort(
+      (a, b) => commitSHAs.indexOf(b.sha) - commitSHAs.indexOf(a.sha)
+    )
+  }
+
   /** This shouldn't be called directly. See `Dispatcher`. */
   public async _cherryPick(
     repository: Repository,
@@ -6577,13 +6672,15 @@ export class AppStore extends TypedBaseStore<IAppState> {
       return CherryPickResult.UnableToStart
     }
 
+    const orderedCommits = this.orderCommitsByHistory(repository, commits)
+
     await this._refreshRepository(repository)
 
     const progressCallback =
       this.getMultiCommitOperationProgressCallBack(repository)
     const gitStore = this.gitStoreCache.get(repository)
     const result = await gitStore.performFailableOperation(() =>
-      cherryPick(repository, commits, progressCallback)
+      cherryPick(repository, orderedCommits, progressCallback)
     )
 
     return result || CherryPickResult.Error
@@ -7230,23 +7327,28 @@ export class AppStore extends TypedBaseStore<IAppState> {
   }
 
   public async _startPullRequest(repository: Repository) {
-    const { branchesState } = this.repositoryStateCache.get(repository)
-    const { defaultBranch, tip } = branchesState
+    const { tip, defaultBranch } =
+      this.repositoryStateCache.get(repository).branchesState
 
-    if (defaultBranch === null || tip.kind !== TipState.Valid) {
+    if (tip.kind !== TipState.Valid) {
+      // Shouldn't even be able to get here if so - just a type check
       return
     }
+
     const currentBranch = tip.branch
     this._initializePullRequestPreview(repository, defaultBranch, currentBranch)
   }
 
   private async _initializePullRequestPreview(
     repository: Repository,
-    baseBranch: Branch,
+    baseBranch: Branch | null,
     currentBranch: Branch
   ) {
-    const { branchesState, localCommitSHAs } =
-      this.repositoryStateCache.get(repository)
+    if (baseBranch === null) {
+      this.showPullRequestPopupNoBaseBranch(repository, currentBranch)
+      return
+    }
+
     const gitStore = this.gitStoreCache.get(repository)
 
     const pullRequestCommits = await gitStore.getCommitsBetweenBranches(
@@ -7313,24 +7415,73 @@ export class AppStore extends TypedBaseStore<IAppState> {
       )
     }
 
-    const { allBranches, recentBranches, defaultBranch } = branchesState
+    this.showPullRequestPopup(repository, currentBranch, commitSHAs)
+  }
+
+  public showPullRequestPopupNoBaseBranch(
+    repository: Repository,
+    currentBranch: Branch
+  ) {
+    this.repositoryStateCache.initializePullRequestState(repository, {
+      baseBranch: null,
+      commitSHAs: null,
+      commitSelection: null,
+      mergeStatus: null,
+    })
+
+    this.emitUpdate()
+
+    this.showPullRequestPopup(repository, currentBranch, [])
+  }
+
+  public showPullRequestPopup(
+    repository: Repository,
+    currentBranch: Branch,
+    commitSHAs: ReadonlyArray<string>
+  ) {
+    if (this.popupManager.areTherePopupsOfType(PopupType.StartPullRequest)) {
+      return
+    }
+
+    this.statsStore.recordPreviewedPullRequest()
+
+    const { branchesState, localCommitSHAs } =
+      this.repositoryStateCache.get(repository)
+    const { allBranches, recentBranches, defaultBranch, currentPullRequest } =
+      branchesState
+    const gitStore = this.gitStoreCache.get(repository)
+    /*  We only want branches that are also on dotcom such that, when we ask a
+     *  user to create a pull request, the base branch also exists on dotcom.
+     */
+    const remote = isForkedRepositoryContributingToParent(repository)
+      ? UpstreamRemoteName
+      : gitStore.defaultRemote?.name
+    const prBaseBranches = allBranches.filter(
+      b => b.upstreamRemoteName === remote || b.remoteName === remote
+    )
+    const prRecentBaseBranches = recentBranches.filter(
+      b => b.upstreamRemoteName === remote || b.remoteName === remote
+    )
     const { imageDiffType, selectedExternalEditor, showSideBySideDiff } =
       this.getState()
 
+    const nonLocalCommitSHA =
+      commitSHAs.length > 0 && !localCommitSHAs.includes(commitSHAs[0])
+        ? commitSHAs[0]
+        : null
+
     this._showPopup({
       type: PopupType.StartPullRequest,
-      allBranches,
+      prBaseBranches,
+      prRecentBaseBranches,
       currentBranch,
       defaultBranch,
       imageDiffType,
-      recentBranches,
       repository,
       externalEditorLabel: selectedExternalEditor ?? undefined,
-      nonLocalCommitSHA:
-        commitSHAs.length > 0 && !localCommitSHAs.includes(commitSHAs[0])
-          ? commitSHAs[0]
-          : null,
+      nonLocalCommitSHA,
       showSideBySideDiff,
+      currentBranchHasPullRequest: currentPullRequest !== null,
     })
   }
 
@@ -7350,7 +7501,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
     const currentBranch = branchesState.tip.branch
     const { baseBranch, commitSHAs } = pullRequestState
-    if (commitSHAs === null) {
+    if (commitSHAs === null || baseBranch === null) {
       return
     }
 
@@ -7461,6 +7612,28 @@ export class AppStore extends TypedBaseStore<IAppState> {
         this.emitUpdate()
       }
     )
+  }
+
+  public _quitApp(evenIfUpdating: boolean) {
+    if (evenIfUpdating) {
+      sendWillQuitEvenIfUpdatingSync()
+    }
+
+    quitApp()
+  }
+
+  public _cancelQuittingApp() {
+    sendCancelQuittingSync()
+  }
+
+  public _setPullRequestSuggestedNextAction(
+    value: PullRequestSuggestedNextAction
+  ) {
+    this.pullRequestSuggestedNextAction = value
+
+    localStorage.setItem(pullRequestSuggestedNextActionKey, value)
+
+    this.emitUpdate()
   }
 }
 
